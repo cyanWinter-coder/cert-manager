@@ -555,6 +555,61 @@ func TestSync(t *testing.T) {
 			},
 			expectedErr: true,
 		},
+		"if calling sign returns a retryable error, we should set Pending condition and return error to retry": {
+			certificateRequest: gen.CertificateRequestFrom(baseCR),
+			issuerImpl: &fake.Issuer{
+				FakeSign: func(context.Context, *cmapi.CertificateRequest, cmapi.GenericIssuer) (*issuer.IssueResponse, error) {
+					return nil, issuer.NewRetryableError(errors.New("issuer temporarily unavailable"))
+				},
+			},
+			builder: &testpkg.Builder{
+				CertManagerObjects: []runtime.Object{baseCR, baseIssuer},
+				ExpectedEvents: []string{
+					"Normal TemporaryError Issuer reported a temporary error, the request will be retried: issuer temporarily unavailable",
+				},
+				ExpectedActions: []testpkg.Action{
+					testpkg.NewAction(coretesting.NewUpdateSubresourceAction(
+						cmapi.SchemeGroupVersion.WithResource("certificaterequests"),
+						"status",
+						gen.DefaultTestNamespace,
+						gen.CertificateRequestFrom(baseCR,
+							gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
+								Type:               cmapi.CertificateRequestConditionReady,
+								Status:             cmmeta.ConditionFalse,
+								Reason:             "Pending",
+								Message:            "Issuer reported a temporary error, the request will be retried: issuer temporarily unavailable",
+								LastTransitionTime: &nowMetaTime,
+							}),
+						),
+					)),
+				},
+			},
+			expectedErr: true,
+		},
+		"if calling sign returns a retryable error and the request is already pending, we should not fire another event": {
+			certificateRequest: gen.CertificateRequestFrom(baseCR,
+				gen.SetCertificateRequestStatusCondition(cmapi.CertificateRequestCondition{
+					Type:               cmapi.CertificateRequestConditionReady,
+					Status:             cmmeta.ConditionFalse,
+					Reason:             "Pending",
+					Message:            "Issuer reported a temporary error, the request will be retried: issuer temporarily unavailable",
+					LastTransitionTime: &nowMetaTime,
+				}),
+			),
+			issuerImpl: &fake.Issuer{
+				FakeSign: func(context.Context, *cmapi.CertificateRequest, cmapi.GenericIssuer) (*issuer.IssueResponse, error) {
+					return nil, issuer.NewRetryableError(errors.New("issuer temporarily unavailable"))
+				},
+			},
+			builder: &testpkg.Builder{
+				CertManagerObjects: []runtime.Object{baseCR, baseIssuer},
+				// No event is fired and no status update is made since the
+				// Pending condition is already up to date.
+				ExpectedEvents:  []string{},
+				ExpectedActions: []testpkg.Action{},
+			},
+			expectedErr: true,
+		},
 		"if calling sign returns nil, nil then we should return nil with no-op since the underlying issuer has probably set the condition to failed": {
 			certificateRequest: gen.CertificateRequestFrom(baseCR),
 			issuerImpl: &fake.Issuer{

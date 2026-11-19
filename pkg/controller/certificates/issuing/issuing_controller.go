@@ -442,10 +442,10 @@ func (c *controller) failIssueCertificate(ctx context.Context, log logr.Logger, 
 	nowTime := metav1.NewTime(c.clock.Now())
 	crt.Status.LastFailureTime = &nowTime
 
-	failedIssuanceAttempts := 1
-	if crt.Status.FailedIssuanceAttempts != nil {
-		failedIssuanceAttempts = *crt.Status.FailedIssuanceAttempts + 1
-	}
+	// Increment the retry counter using the same normalization the trigger
+	// controller uses when computing the backoff delay, so the retry state
+	// is interpreted identically on both sides.
+	failedIssuanceAttempts := apiutil.GetCertificateFailedIssuanceAttempts(crt) + 1
 	crt.Status.FailedIssuanceAttempts = &failedIssuanceAttempts
 
 	log.V(logf.DebugLevel).Info("CertificateRequest in failed state so retrying issuance later")

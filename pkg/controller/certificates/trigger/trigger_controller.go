@@ -27,6 +27,7 @@ import (
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
@@ -65,6 +66,16 @@ const (
 	// otherwise expire (after one hour by default) long before the next
 	// informer resync.
 	mldsaPrivateKeysDisabledRecheckInterval = 30 * time.Minute
+
+	// backoffJitterMaxFactor is the maximum jitter, as a fraction of the
+	// computed backoff delay, that is added when scheduling the next issuance
+	// retry after a failure. When many Certificates fail at the same time
+	// (e.g. during an issuer outage) their status.lastFailureTime values are
+	// nearly identical, so without jitter they would all be retried at the
+	// same instant, overwhelming the issuer that has just recovered and
+	// risking duplicate issuance. Jitter spreads these concurrent retries
+	// over time.
+	backoffJitterMaxFactor = 0.2
 )
 
 // This controller observes the state of the certificate's currently
@@ -91,6 +102,12 @@ type controller struct {
 	clock              clock.Clock
 	shouldReissue      policies.Func
 	dataForCertificate func(context.Context, *cmapi.Certificate) (policies.Input, error)
+
+	// backoffJitter adds jitter to a backoff delay before the next issuance
+	// retry is scheduled. It is a field so that tests can replace it with a
+	// deterministic function; see backoffJitterMaxFactor for why jitter is
+	// applied.
+	backoffJitter func(time.Duration) time.Duration
 }
 
 func NewController(
@@ -165,6 +182,10 @@ func NewController(
 			CertificateRequestLister: certificateRequestInformer.Lister(),
 			SecretLister:             secretsInformer.Lister(),
 		}).DataForCertificate,
+
+		backoffJitter: func(d time.Duration) time.Duration {
+			return wait.Jitter(d, backoffJitterMaxFactor)
+		},
 	}, queue, mustSync, nil
 }
 
@@ -220,6 +241,12 @@ func (c *controller) ProcessItem(ctx context.Context, key types.NamespacedName) 
 	// Don't trigger issuance if we need to back off due to previous failures and Certificate's spec has not changed.
 	backoff, delay := shouldBackoffReissuingOnFailure(log, c.clock, input.Certificate, input.NextRevisionRequest, c.certificateRequestMinimumBackoffDuration, c.certificateRequestMaximumBackoffDuration)
 	if backoff {
+		// Add jitter to the delay so that Certificates that failed at the
+		// same time (e.g. during an issuer outage) are not all retried at
+		// the same instant.
+		if c.backoffJitter != nil {
+			delay = c.backoffJitter(delay)
+		}
 		nextIssuanceRetry := c.clock.Now().Add(delay)
 		message := fmt.Sprintf("Backing off from issuance due to previously failed issuance(s). Issuance will next be attempted at %v", nextIssuanceRetry)
 		log.V(logf.InfoLevel).Info(message)
@@ -350,18 +377,14 @@ func shouldBackoffReissuingOnFailure(log logr.Logger, c clock.Clock, crt *cmapi.
 	// crt.Status.FailedIssuanceAttempts == nil (in case of the Certificate having
 	// failed for an installation of cert-manager before the issuance
 	// attempts were introduced). In such case delay = initialDelay.
-	if crt.Status.FailedIssuanceAttempts != nil {
-		if *crt.Status.FailedIssuanceAttempts <= 0 {
-			// FailedIssuanceAttempts <= 0 can only arise from a manual kubectl patch;
-			// treat it the same as nil (use initialDelay).
-			delay = initialDelay
+	// FailedIssuanceAttempts <= 0 can only arise from a manual kubectl patch;
+	// treat it the same as nil (use initialDelay).
+	if attempts := apiutil.GetCertificateFailedIssuanceAttempts(crt); attempts > 0 {
+		computed := initialDelay * time.Duration(math.Pow(2, float64(attempts-1)))
+		if computed < initialDelay || computed > maxDelay {
+			delay = maxDelay
 		} else {
-			computed := initialDelay * time.Duration(math.Pow(2, float64(*crt.Status.FailedIssuanceAttempts-1)))
-			if computed < initialDelay || computed > maxDelay {
-				delay = maxDelay
-			} else {
-				delay = computed
-			}
+			delay = computed
 		}
 	}
 

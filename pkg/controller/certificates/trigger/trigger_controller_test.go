@@ -18,6 +18,7 @@ package trigger
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/go-logr/logr/testr"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -88,6 +90,16 @@ func Test_controller_ProcessItem(t *testing.T) {
 		// wantScheduled is the delays with which the Certificate is expected
 		// to be added to the scheduled work queue, in order.
 		wantScheduled []time.Duration
+
+		// backoffJitter, if set, replaces the controller's backoff jitter
+		// function. If nil, an identity function is used so that scheduled
+		// delays are exact.
+		backoffJitter func(time.Duration) time.Duration
+
+		// simulateStatusUpdateConflict, if true, makes the Certificate status
+		// update fail with a conflict error, simulating a concurrent
+		// reconcile having modified the Certificate.
+		simulateStatusUpdateConflict bool
 
 		// mldsaFeatureEnabled is the state of the MLDSAPrivateKeys feature
 		// gate during the test.
@@ -241,6 +253,53 @@ func Test_controller_ProcessItem(t *testing.T) {
 			},
 			wantShouldReissueCalled: false,
 			wantScheduled:           []time.Duration{time.Minute},
+		},
+		"should apply jitter to the backoff delay when issuance failed once 59 minutes ago": {
+			existingCertificate: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateUID("cert-1-uid"),
+				gen.SetCertificateRevision(1),
+				gen.SetCertificateDNSNames("example.com"),
+				gen.SetCertificateLastFailureTime(metav1.NewTime(fixedNow.Add(-59*time.Minute))),
+				gen.SetCertificateIssuanceAttempts(new(1)),
+			),
+			wantDataForCertificateCalled: true,
+			mockDataForCertificateReturn: policies.Input{
+				NextRevisionRequest: createCertificateRequestOrPanic(gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+					gen.SetCertificateUID("cert-1-uid"),
+					gen.SetCertificateRevision(2),
+					gen.SetCertificateDNSNames("example.com"),
+				)),
+			},
+			backoffJitter: func(d time.Duration) time.Duration {
+				return d + 30*time.Second
+			},
+			wantShouldReissueCalled: false,
+			wantScheduled:           []time.Duration{time.Minute + 30*time.Second},
+		},
+		"should return an error and not record an event when the status update conflicts with a concurrent reconcile": {
+			existingCertificate: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
+				gen.SetCertificateGeneration(42),
+			),
+			simulateStatusUpdateConflict: true,
+			wantDataForCertificateCalled: true,
+			mockDataForCertificateReturn: policies.Input{},
+			wantShouldReissueCalled:      true,
+			mockShouldReissue: func(*testing.T) policies.Func {
+				return func(policies.Input) (string, string, bool) {
+					return "ForceTriggered", "Re-issuance forced by unit test case", true
+				}
+			},
+			// The update is attempted (and recorded by the fake clientset)
+			// but rejected by the conflict reactor.
+			wantConditions: []cmapi.CertificateCondition{{
+				Type:               "Issuing",
+				Status:             "True",
+				Reason:             "ForceTriggered",
+				Message:            "Re-issuance forced by unit test case",
+				LastTransitionTime: &fixedNow,
+				ObservedGeneration: 42,
+			}},
+			wantErr: `Operation cannot be fulfilled on certificates.cert-manager.io "cert-1": simulated conflict`,
 		},
 		"should set Issuing=True when issuance failed once 59 minutes ago but cert and next CR are mismatched": {
 			existingCertificate: gen.Certificate("cert-1", gen.SetCertificateNamespace("testns"),
@@ -481,6 +540,15 @@ func Test_controller_ProcessItem(t *testing.T) {
 			}
 			builder.Init()
 
+			if test.simulateStatusUpdateConflict {
+				builder.FakeCMClient().PrependReactor("update", "certificates",
+					func(action coretesting.Action) (bool, runtime.Object, error) {
+						return true, nil, apierrors.NewConflict(
+							cmapi.Resource("certificates"), "cert-1", errors.New("simulated conflict"))
+					},
+				)
+			}
+
 			w := &controllerWrapper{}
 			_, _, err := w.Register(builder.Context)
 			if err != nil {
@@ -490,6 +558,13 @@ func Test_controller_ProcessItem(t *testing.T) {
 			// These are the default backoff durations set by the config API.
 			w.certificateRequestMinimumBackoffDuration = 1 * time.Hour
 			w.certificateRequestMaximumBackoffDuration = 32 * time.Hour
+
+			// Use a deterministic jitter function so that scheduled delays
+			// are exact, unless the test overrides it.
+			w.backoffJitter = func(d time.Duration) time.Duration { return d }
+			if test.backoffJitter != nil {
+				w.backoffJitter = test.backoffJitter
+			}
 
 			var gotScheduled []time.Duration
 			w.scheduledWorkQueue = &schedulertest.FakeScheduler{

@@ -397,3 +397,24 @@ func CertificateRequestIsDenied(cr *cmapi.CertificateRequest) bool {
 
 	return false
 }
+
+// GetCertificateFailedIssuanceAttempts returns the number of consecutive
+// failed issuance attempts recorded in the Certificate's status
+// (status.failedIssuanceAttempts). A nil or negative value (the latter can
+// only arise from a manual status patch) is normalized to 0.
+//
+// This helper is the single interpretation of the Certificate's issuance
+// retry state, shared by the certificates-trigger controller (which uses it
+// to compute the exponential backoff delay) and the certificates-issuing
+// controller (which increments it after each failed issuance). Keeping the
+// normalization in one place prevents the two controllers from drifting
+// apart and losing or miscounting retry state.
+func GetCertificateFailedIssuanceAttempts(crt *cmapi.Certificate) int {
+	if crt == nil ||
+		crt.Status.FailedIssuanceAttempts == nil ||
+		*crt.Status.FailedIssuanceAttempts < 0 {
+		return 0
+	}
+
+	return *crt.Status.FailedIssuanceAttempts
+}

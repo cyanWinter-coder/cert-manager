@@ -34,6 +34,7 @@ import (
 	"github.com/cert-manager/cert-manager/pkg/apis/certmanager"
 	cmapi "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	"github.com/cert-manager/cert-manager/pkg/issuer"
 	logf "github.com/cert-manager/cert-manager/pkg/logs"
 	utilfeature "github.com/cert-manager/cert-manager/pkg/util/feature"
 	"github.com/cert-manager/cert-manager/pkg/util/pki"
@@ -140,6 +141,19 @@ func (c *Controller) Sync(ctx context.Context, cr *cmapi.CertificateRequest) (er
 	// Attempt to call the Sign function on our issuer
 	resp, err := c.issuer.Sign(ctx, crCopy, issuerObj)
 	if err != nil {
+		if issuer.IsRetryableError(err) {
+			// The issuer has signaled that the failure is transient (e.g. the
+			// issuer's backing service is temporarily unavailable). Mark the
+			// request as Pending rather than Failed so that the Certificate's
+			// failure state is not updated and the exponential issuance
+			// backoff in the certificates-trigger controller is not consumed,
+			// and return the error so that the request is retried via the
+			// rate-limited workqueue.
+			log.V(logf.InfoLevel).Info("issuer reported a temporary error, will retry", "error", err.Error())
+			c.reporter.Pending(crCopy, err, "TemporaryError",
+				"Issuer reported a temporary error, the request will be retried")
+			return err
+		}
 		log.Error(err, "error issuing certificate request")
 		return err
 	}
